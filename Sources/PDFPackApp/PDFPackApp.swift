@@ -500,7 +500,7 @@ enum PDFItemType: String {
             }
         }
         let ext = url.pathExtension.lowercased()
-        if ext == "txt" {
+        if ext == "txt" || ext == "md" {
             return .text
         }
         if ext == "doc" || ext == "docx" {
@@ -649,12 +649,169 @@ enum PDFBuilder {
 
     private static func makeTextDocument(text: String) -> PDFDocument {
         let content = text.isEmpty ? "(Empty text file)" : text
-        let attributes: [NSAttributedString.Key: Any] = [
+        
+        // Parse text for special formatting: page separators (==========) and headers (between ----)
+        let parsedContent = parseTextContent(content)
+        
+        // If we have multiple pages, create a document with multiple pages
+        if parsedContent.pages.count > 1 {
+            return makeMultiPageTextDocument(pages: parsedContent.pages)
+        }
+        
+        // Single page document
+        let attributedText = parsedContent.pages.first?.attributedString ?? NSAttributedString(string: content, attributes: [
             .font: NSFont.systemFont(ofSize: 11),
             .foregroundColor: NSColor.black
-        ]
-        let attributedText = NSAttributedString(string: content, attributes: attributes)
+        ])
         return makeAttributedDocument(attributedText, topInset: headerGap)
+    }
+    
+    private struct ParsedTextPage {
+        let attributedString: NSAttributedString
+    }
+    
+    private struct ParsedTextContent {
+        let pages: [ParsedTextPage]
+    }
+    
+    private static func parseTextContent(_ text: String) -> ParsedTextContent {
+        let lines = text.components(separatedBy: .newlines)
+        var pages: [ParsedTextPage] = []
+        var currentPageLines: [String] = []
+        var inHeaderSection = false
+        var headerLines: [String] = []
+        
+        let normalFont = NSFont.systemFont(ofSize: 11)
+        let headerFont = NSFont.systemFont(ofSize: 9)
+        let normalAttributes: [NSAttributedString.Key: Any] = [
+            .font: normalFont,
+            .foregroundColor: NSColor.black
+        ]
+        let headerAttributes: [NSAttributedString.Key: Any] = [
+            .font: headerFont,
+            .foregroundColor: NSColor.black
+        ]
+        
+        for line in lines {
+            // Check for page separator (line starting with ==========)
+            if line.trimmingCharacters(in: .whitespaces).hasPrefix("==========") {
+                // Finish current page if it has content
+                if !currentPageLines.isEmpty || !headerLines.isEmpty {
+                    let pageContent = buildAttributedString(
+                        pageLines: currentPageLines,
+                        headerLines: headerLines,
+                        normalAttributes: normalAttributes,
+                        headerAttributes: headerAttributes
+                    )
+                    pages.append(ParsedTextPage(attributedString: pageContent))
+                    currentPageLines = []
+                    headerLines = []
+                    inHeaderSection = false
+                }
+                continue
+            }
+            
+            // Check for header separator (line with ----)
+            if line.trimmingCharacters(in: .whitespaces) == "----" || line.trimmingCharacters(in: .whitespaces).hasPrefix("----") {
+                inHeaderSection.toggle()
+                continue
+            }
+            
+            // Add line to appropriate section
+            if inHeaderSection {
+                headerLines.append(line)
+            } else {
+                currentPageLines.append(line)
+            }
+        }
+        
+        // Add final page
+        if !currentPageLines.isEmpty || !headerLines.isEmpty {
+            let pageContent = buildAttributedString(
+                pageLines: currentPageLines,
+                headerLines: headerLines,
+                normalAttributes: normalAttributes,
+                headerAttributes: headerAttributes
+            )
+            pages.append(ParsedTextPage(attributedString: pageContent))
+        }
+        
+        // If no pages were created, create one with all content
+        if pages.isEmpty {
+            let attributedText = NSAttributedString(string: text, attributes: normalAttributes)
+            pages.append(ParsedTextPage(attributedString: attributedText))
+        }
+        
+        return ParsedTextContent(pages: pages)
+    }
+    
+    private static func buildAttributedString(
+        pageLines: [String],
+        headerLines: [String],
+        normalAttributes: [NSAttributedString.Key: Any],
+        headerAttributes: [NSAttributedString.Key: Any]
+    ) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        
+        // Add header lines first (if any)
+        if !headerLines.isEmpty {
+            for headerLine in headerLines {
+                if !result.string.isEmpty {
+                    result.append(NSAttributedString(string: "\n", attributes: normalAttributes))
+                }
+                result.append(NSAttributedString(string: headerLine, attributes: headerAttributes))
+            }
+            if !pageLines.isEmpty {
+                result.append(NSAttributedString(string: "\n\n", attributes: normalAttributes))
+            }
+        }
+        
+        // Add normal content lines
+        for (index, line) in pageLines.enumerated() {
+            if index > 0 || !headerLines.isEmpty {
+                result.append(NSAttributedString(string: "\n", attributes: normalAttributes))
+            }
+            result.append(NSAttributedString(string: line, attributes: normalAttributes))
+        }
+        
+        return result
+    }
+    
+    private static func makeMultiPageTextDocument(pages: [ParsedTextPage]) -> PDFDocument {
+        let data = NSMutableData()
+        var mediaBox = CGRect(origin: .zero, size: pageSize)
+        guard let consumer = CGDataConsumer(data: data as CFMutableData),
+              let context = CGContext(consumer: consumer, mediaBox: &mediaBox, nil) else {
+            return PDFDocument()
+        }
+        
+        let textRect = CGRect(
+            x: margin,
+            y: margin,
+            width: pageSize.width - margin * 2,
+            height: pageSize.height - margin * 2 - headerGap
+        )
+        
+        for page in pages {
+            let framesetter = CTFramesetterCreateWithAttributedString(page.attributedString)
+            var currentRange = CFRange(location: 0, length: 0)
+            
+            while currentRange.location < page.attributedString.length {
+                context.beginPDFPage(nil)
+                context.textMatrix = .identity
+                let path = CGMutablePath()
+                path.addRect(textRect)
+                let frame = CTFramesetterCreateFrame(framesetter, currentRange, path, nil)
+                CTFrameDraw(frame, context)
+                let visibleRange = CTFrameGetVisibleStringRange(frame)
+                currentRange.location += visibleRange.length
+                currentRange.length = 0
+                context.endPDFPage()
+            }
+        }
+        
+        context.closePDF()
+        return PDFDocument(data: data as Data) ?? PDFDocument()
     }
 
     private static func makeAttributedDocument(_ attributedText: NSAttributedString, topInset: CGFloat = 0) -> PDFDocument {
